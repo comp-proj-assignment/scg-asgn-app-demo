@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1.7
+#
+# CI-only Dockerfile. Consumes the layered jar produced by the shared-lib
+# `package` job (downloaded into ./target/ before this build runs). Skips
+# the inner Maven build entirely.
+#
+# Use ./Dockerfile for local dev (it builds inside Docker).
+# Use ./Dockerfile.ci in CI (~3 min faster — no rebuild, no dep download).
+
+FROM eclipse-temurin:21-jdk-alpine AS extractor
+WORKDIR /build
+
+COPY target/*.jar app.jar
+RUN java -Djarmode=layertools -jar app.jar extract --destination extracted
+
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+
+RUN addgroup -S app && adduser -S -G app -u 1001 app
+
+COPY --from=extractor /build/extracted/dependencies/         ./
+COPY --from=extractor /build/extracted/spring-boot-loader/   ./
+COPY --from=extractor /build/extracted/snapshot-dependencies/ ./
+COPY --from=extractor /build/extracted/application/          ./
+
+USER 1001
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/actuator/health/liveness || exit 1
+
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]

@@ -1,1 +1,1 @@
-# scg-asgn-app-demo
+# comp-proj-app-demo
