@@ -39,7 +39,7 @@ env:
   APP_DIR: app/backend
   REGISTRY: public.ecr.aws/c5a3w2d1
   IMAGE_NAME: public.ecr.aws/c5a3w2d1/backend
-  DEPLOY_REPO: comp-proj-assignment/scg-asgn-app-demo-deployment
+  DEPLOY_REPO: scg-sre/scg-asgn-app-demo-deployment
 
 jobs:
   # ─── Decode the event once. Every downstream job gates on these outputs ──

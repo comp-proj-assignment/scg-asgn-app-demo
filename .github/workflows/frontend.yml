@@ -33,7 +33,7 @@ env:
   APP_DIR: app/frontend
   REGISTRY: public.ecr.aws/c5a3w2d1
   IMAGE_NAME: public.ecr.aws/c5a3w2d1/frontend
-  DEPLOY_REPO: comp-proj-assignment/scg-asgn-app-demo-deployment
+  DEPLOY_REPO: scg-sre/scg-asgn-app-demo-deployment
 
 jobs:
   plan:
