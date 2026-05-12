@@ -184,7 +184,7 @@ jobs:
       needs.build.result      != 'failure' && needs.build.result      != 'cancelled'
     runs-on: ubuntu-latest
     concurrency:
-      group: gitops-bump-${{ env.SERVICE }}-${{ needs.plan.outputs.target_env }}
+      group: gitops-bump-frontend-${{ needs.plan.outputs.target_env }}
       cancel-in-progress: false
     steps:
       - name: Checkout deploy repo
