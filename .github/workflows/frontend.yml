@@ -1,0 +1,280 @@
+name: frontend
+
+# Gitflow + GitOps: see backend.yml header for the flow matrix.
+on:
+  create:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [develop, "release/**", main]
+    paths:
+      - "app/frontend/**"
+      - ".github/workflows/frontend.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, qa, staging, prod]
+      image_tag:
+        description: Existing image tag. Leave blank to build (non-prod) or to promote previous env (prod ← staging).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SERVICE: frontend
+  APP_DIR: app/frontend
+  REGISTRY: public.ecr.aws/c5a3w2d1
+  IMAGE_NAME: public.ecr.aws/c5a3w2d1/frontend
+  DEPLOY_REPO: comp/comp-proj-app-demo-deployment
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      should_test:   ${{ steps.out.outputs.should_test }}
+      should_build:  ${{ steps.out.outputs.should_build }}
+      should_push:   ${{ steps.out.outputs.should_push }}
+      should_deploy: ${{ steps.out.outputs.should_deploy }}
+      action:        ${{ steps.out.outputs.action }}
+      target_env:    ${{ steps.out.outputs.target_env }}
+      source_env:    ${{ steps.out.outputs.source_env }}
+    steps:
+      - id: out
+        env:
+          EVENT:        ${{ github.event_name }}
+          PR_ACTION:    ${{ github.event.action }}
+          PR_MERGED:    ${{ github.event.pull_request.merged }}
+          PR_BASE:      ${{ github.event.pull_request.base.ref }}
+          CREATED_TYPE: ${{ github.event.ref_type }}
+          CREATED_REF:  ${{ github.event.ref }}
+          INPUT_ENV:    ${{ github.event.inputs.environment }}
+          INPUT_TAG:    ${{ github.event.inputs.image_tag }}
+        run: |
+          should_test=false
+          should_build=false
+          should_push=false
+          should_deploy=false
+          action=""
+          target_env=""
+          source_env=""
+
+          case "$EVENT" in
+            create)
+              if [ "$CREATED_TYPE" = "branch" ] && [[ "$CREATED_REF" == release/* ]]; then
+                should_deploy=true; action=pr; target_env=staging; source_env=dev
+              fi
+              ;;
+            pull_request)
+              should_test=true
+              if [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
+                case "$PR_BASE" in
+                  develop)
+                    should_build=true; should_push=true
+                    should_deploy=true; action=direct; target_env=dev ;;
+                  release/*)
+                    should_build=true; should_push=true
+                    should_deploy=true; action=direct; target_env=staging ;;
+                  main)
+                    should_deploy=true; action=pr; target_env=prod; source_env=staging ;;
+                esac
+              elif [ "$PR_ACTION" != "closed" ]; then
+                case "$PR_BASE" in
+                  develop|release/*) should_build=true ;;
+                esac
+              fi
+              ;;
+            workflow_dispatch)
+              should_test=true
+              should_deploy=true
+              target_env="$INPUT_ENV"
+              if [ "$target_env" = "prod" ]; then
+                action=pr; source_env=staging
+              else
+                action=direct
+                if [ -z "$INPUT_TAG" ]; then
+                  should_build=true; should_push=true
+                fi
+              fi
+              ;;
+          esac
+
+          {
+            echo "should_test=$should_test"
+            echo "should_build=$should_build"
+            echo "should_push=$should_push"
+            echo "should_deploy=$should_deploy"
+            echo "action=$action"
+            echo "target_env=$target_env"
+            echo "source_env=$source_env"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "── plan ──"
+          echo "event=$EVENT test=$should_test build=$should_build push=$should_push deploy=$should_deploy"
+          echo "target=$target_env action=$action source=$source_env"
+
+  pre-build:
+    needs: plan
+    if: needs.plan.outputs.should_test == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+      - name: Install + test + build
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npm ci
+          npm test -- --run
+          npm run build
+
+  build:
+    needs: [plan, pre-build]
+    if: needs.plan.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - if: needs.plan.outputs.should_push == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - if: needs.plan.outputs.should_push == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (push=${{ needs.plan.outputs.should_push }})
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          push: ${{ needs.plan.outputs.should_push == 'true' }}
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ env.SERVICE }}
+          cache-to: type=gha,scope=${{ env.SERVICE }},mode=max
+
+  gitops-ci:
+    needs: [plan, pre-build, build]
+    if: |
+      always() &&
+      needs.plan.outputs.should_deploy == 'true' &&
+      needs.pre-build.result != 'failure' && needs.pre-build.result != 'cancelled' &&
+      needs.build.result      != 'failure' && needs.build.result      != 'cancelled'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gitops-bump-${{ env.SERVICE }}-${{ needs.plan.outputs.target_env }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          token: ${{ secrets.DEPLOY_REPO_PAT }}
+          fetch-depth: 0
+
+      - name: Resolve image tag
+        id: tag
+        env:
+          SOURCE_ENV:   ${{ needs.plan.outputs.source_env }}
+          BUILD_TAG:    ${{ needs.build.outputs.image_tag }}
+          DISPATCH_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          if [ -n "$SOURCE_ENV" ]; then
+            IMAGE="$(yq '.[0].value' apps/${SERVICE}/envs/${SOURCE_ENV}/version.yml)"
+            if [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
+              echo "Could not read ${SOURCE_ENV}/version.yml"; exit 1
+            fi
+            TAG="${IMAGE##*:}"
+          elif [ -n "$DISPATCH_TAG" ]; then
+            TAG="$DISPATCH_TAG"; IMAGE="${IMAGE_NAME}:${TAG}"
+          else
+            TAG="$BUILD_TAG";    IMAGE="${IMAGE_NAME}:${TAG}"
+          fi
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite version.yml
+        env:
+          IMAGE:        ${{ steps.tag.outputs.image }}
+          VERSION_FILE: apps/${{ env.SERVICE }}/envs/${{ needs.plan.outputs.target_env }}/version.yml
+        run: yq -i '.[0].value = strenv(IMAGE)' "$VERSION_FILE"
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit + push (direct)
+        if: needs.plan.outputs.action == 'direct'
+        env:
+          TARGET: ${{ needs.plan.outputs.target_env }}
+          TAG:    ${{ steps.tag.outputs.tag }}
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes — ${TARGET} already at ${TAG}"; exit 0
+          fi
+          git commit -m "ci(${TARGET}): bump ${SERVICE} to ${TAG}"
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          for i in 1 2 3; do
+            git pull --rebase origin "$BRANCH" || true
+            git push origin "HEAD:$BRANCH" && exit 0
+            sleep $((i * 3))
+          done
+          echo "Push failed after retries"; exit 1
+
+      - name: Open promotion PR
+        if: needs.plan.outputs.action == 'pr'
+        env:
+          GH_TOKEN:    ${{ secrets.DEPLOY_REPO_PAT }}
+          TARGET:      ${{ needs.plan.outputs.target_env }}
+          SOURCE_ENV:  ${{ needs.plan.outputs.source_env }}
+          TAG:         ${{ steps.tag.outputs.tag }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_SHA:  ${{ github.sha }}
+          ACTOR:       ${{ github.actor }}
+          EVENT:       ${{ github.event_name }}
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes — ${TARGET} already at ${TAG}"; exit 0
+          fi
+          BRANCH="promote/${SERVICE}-${TARGET}-${TAG}"
+          git checkout -b "$BRANCH"
+          git commit -m "promote(${SERVICE}): ${SOURCE_ENV} → ${TARGET} (${TAG})"
+          git push -u origin "$BRANCH"
+          BODY_FILE="$(mktemp)"
+          {
+            printf 'Promotes `%s` from **%s** to **%s** at tag `%s`.\n\n' "$SERVICE" "$SOURCE_ENV" "$TARGET" "$TAG"
+            printf 'Source: %s@%s\n' "$SOURCE_REPO" "$SOURCE_SHA"
+            printf 'Triggered by: @%s via %s.\n\n' "$ACTOR" "$EVENT"
+            printf 'Merging updates `apps/%s/envs/%s/version.yml`.\n' "$SERVICE" "$TARGET"
+          } > "$BODY_FILE"
+          gh pr create \
+            --repo "$DEPLOY_REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "promote ${SERVICE} ${SOURCE_ENV} → ${TARGET}: ${TAG}" \
+            --body-file "$BODY_FILE"

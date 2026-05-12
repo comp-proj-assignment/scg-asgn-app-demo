@@ -1,0 +1,77 @@
+name: backport
+
+# Gitflow back-merges (always to develop; hotfixes also fan out to active releases):
+#   PR merged → release/**          → backport to develop
+#   PR merged → main (from release) → sync remaining commits to develop
+#   PR merged → main (from hotfix)  → backport to develop + every active release/**
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - "release/**"
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  plan:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.out.outputs.targets }}  # space-separated branch list
+      kind:    ${{ steps.out.outputs.kind }}     # release-fix | release-close | hotfix
+    steps:
+      - id: out
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ secrets.DEPLOY_REPO_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          targets=""
+          kind=""
+          if [[ "$BASE" == release/* ]]; then
+            kind="release-fix"
+            targets="develop"
+          elif [ "$BASE" = "main" ]; then
+            if [[ "$HEAD" == release/* ]]; then
+              kind="release-close"
+              targets="develop"
+            elif [[ "$HEAD" == hotfix/* ]]; then
+              kind="hotfix"
+              # develop + every currently-open release/** branch
+              active_releases="$(gh api "repos/$REPO/branches" --paginate -q '.[].name' | grep '^release/' || true)"
+              targets="develop $active_releases"
+            fi
+          fi
+          echo "kind=$kind"       >> "$GITHUB_OUTPUT"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "── plan ── kind=$kind base=$BASE head=$HEAD"
+          echo "targets: $targets"
+
+  backport:
+    needs: plan
+    if: needs.plan.outputs.targets != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.DEPLOY_REPO_PAT }}
+
+      - name: Open backport PR(s)
+        uses: korthout/backport-action@v3
+        with:
+          target_branches: ${{ needs.plan.outputs.targets }}
+          pull_title: "backport (${{ needs.plan.outputs.kind }}): ${pull_title}"
+          pull_description: |
+            Auto-backport of #${pull_number} from `${pull_base_ref}` to `${target_branch}`.
+
+            Kind: **${{ needs.plan.outputs.kind }}** — Gitflow requires this back-merge
+            so the fix survives the next release cut and any active release branches.
+
+            Resolve conflicts in-PR if the cherry-pick didn't apply cleanly.
+          label_pattern: ""
+          merge_commits: skip
