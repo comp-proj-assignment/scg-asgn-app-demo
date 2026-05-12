@@ -154,10 +154,16 @@ jobs:
         run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - if: needs.plan.outputs.should_push == 'true'
+        id: common
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: echo "region=${AWS_REGION:-us-east-1}" >> "$GITHUB_OUTPUT"
+
+      - if: needs.plan.outputs.should_push == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-          aws-region: us-east-1
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ steps.common.outputs.region }}
 
       - if: needs.plan.outputs.should_push == 'true'
         uses: aws-actions/amazon-ecr-login@v2
